@@ -239,10 +239,11 @@ def predict(
     gpu_ids: str = typer.Option(None, help="Comma-separated GPU IDs to use (e.g., '0,1,2'). Defaults to all GPUs."),
     num_gpus: int = typer.Option(0, help="Maximum number of GPUs to use. 0 = use all available."),
     aggregate_windows: bool = typer.Option(
-        False,
+        True,
         help="Average softmax probabilities across overlapping windows per genomic "
              "span before argmax (resolves duplicate/conflicting labels at the same "
-             "position). Default False = legacy per-window independent argmax."),
+             "position). On by default; use --no-aggregate-windows for the legacy "
+             "per-window independent argmax."),
     te_threshold: float = typer.Option(
         None,
         help="Confidence gate: a span is called TE only if its max non-Background "
@@ -385,8 +386,9 @@ def predict(
 
     final_annotations = []
 
-    # Activamos la ruta de probabilidad solo si se pide alguna mejora opt-in.
-    # Sin flags -> prob_path=False -> rama legacy idéntica al comportamiento actual.
+    # La ruta de probabilidad está activa por defecto (aggregate_windows=True).
+    # Con --no-aggregate-windows y sin --te-threshold/--export-conf ->
+    # prob_path=False -> rama legacy idéntica al comportamiento anterior.
     prob_path = (te_threshold is not None) or export_conf or aggregate_windows
     if prob_path:
         print(f"🔬 Probability path ON (aggregate_windows={aggregate_windows}, "
