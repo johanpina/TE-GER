@@ -142,25 +142,53 @@ class GenomeChunkDataset(Dataset):
         }
 
 # --- 3. POST-PROCESSING ---
+def _start_conf_acc(d):
+    """Inicializa el acumulador de confianza ponderada por longitud (in-place)."""
+    w = max(d['end'] - d['start'], 1)
+    d['_wsum'] = d.get('conf', 0.0) * w
+    d['_wlen'] = w
+
+def _finalize_conf(d):
+    """Cierra el acumulador: conf = media ponderada por longitud."""
+    if '_wlen' in d:
+        d['conf'] = d['_wsum'] / d['_wlen'] if d['_wlen'] > 0 else d.get('conf', 0.0)
+        d.pop('_wsum', None); d.pop('_wlen', None)
+
 def merge_annotations(raw_preds: List[Dict], gap_tolerance=10) -> List[Dict]:
     if not raw_preds: return []
     # Sorting is critical for merge
     raw_preds.sort(key=lambda x: (x['seq_id'], x['start']))
     merged = []
-    current = raw_preds[0]
+    # Copia para no mutar los dicts del llamador
+    current = dict(raw_preds[0])
+    has_conf = 'conf' in current
+    if has_conf: _start_conf_acc(current)
 
     for next_pred in raw_preds[1:]:
         if (next_pred['seq_id'] == current['seq_id'] and
             next_pred['label'] == current['label'] and
             next_pred['start'] <= current['end'] + gap_tolerance):
             current['end'] = max(current['end'], next_pred['end'])
+            if has_conf:
+                w = max(next_pred['end'] - next_pred['start'], 1)
+                current['_wsum'] += next_pred.get('conf', 0.0) * w
+                current['_wlen'] += w
         else:
+            if has_conf: _finalize_conf(current)
             merged.append(current)
-            current = next_pred
+            current = dict(next_pred)
+            if has_conf: _start_conf_acc(current)
+    if has_conf: _finalize_conf(current)
     merged.append(current)
     return merged
 
-def write_gff3(annotations: List[Dict], output_path: str, source="TEGER"):
+def filter_min_length(annotations: List[Dict], min_len: int) -> List[Dict]:
+    """Descarta anotaciones más cortas que min_len pb. min_len<=0 -> sin filtro."""
+    if min_len <= 0:
+        return annotations
+    return [a for a in annotations if (a['end'] - a['start']) >= min_len]
+
+def write_gff3(annotations: List[Dict], output_path: str, source="TEGER", export_conf=False):
     print(f"💾 Saving {len(annotations)} annotations to {output_path}...")
     with open(output_path, "w") as f:
         f.write("##gff-version 3\n")
@@ -168,7 +196,12 @@ def write_gff3(annotations: List[Dict], output_path: str, source="TEGER"):
             # GFF is 1-based
             start = ann['start'] + 1
             end = ann['end']
-            line = f"{ann['seq_id']}\t{source}\t{ann['label']}\t{start}\t{end}\t.\t+\t.\tID={ann['label']}_{start}_{end}\n"
+            conf = ann.get('conf')
+            score = f"{conf:.4f}" if (export_conf and conf is not None) else "."
+            attrs = f"ID={ann['label']}_{start}_{end}"
+            if export_conf and conf is not None:
+                attrs += f";conf={conf:.4f}"
+            line = f"{ann['seq_id']}\t{source}\t{ann['label']}\t{start}\t{end}\t{score}\t+\t.\t{attrs}\n"
             f.write(line)
 
 def write_fasta_library(annotations: List[Dict], genome_path: str, output_path: str):
@@ -204,7 +237,24 @@ def predict(
     chunk_size: int = typer.Option(1000000, help="Chunk size in base pairs. Adjust based on available VRAM."),
     device: str = typer.Option("cuda", help="Execution device (cuda/cpu)."),
     gpu_ids: str = typer.Option(None, help="Comma-separated GPU IDs to use (e.g., '0,1,2'). Defaults to all GPUs."),
-    num_gpus: int = typer.Option(0, help="Maximum number of GPUs to use. 0 = use all available.")
+    num_gpus: int = typer.Option(0, help="Maximum number of GPUs to use. 0 = use all available."),
+    aggregate_windows: bool = typer.Option(
+        False,
+        help="Average softmax probabilities across overlapping windows per genomic "
+             "span before argmax (resolves duplicate/conflicting labels at the same "
+             "position). Default False = legacy per-window independent argmax."),
+    te_threshold: float = typer.Option(
+        None,
+        help="Confidence gate: a span is called TE only if its max non-Background "
+             "probability >= this value (0-1). Reduces over-prediction. "
+             "Default None = legacy argmax (no threshold)."),
+    min_len: int = typer.Option(
+        0,
+        help="Drop final merged annotations shorter than N bp. 0 = no filter (default)."),
+    export_conf: bool = typer.Option(
+        False,
+        help="Write the mean confidence into GFF column 6 (score) and a ;conf= "
+             "attribute. Default False = legacy '.' score.")
 ):
     # Preemptive GPU memory cleanup
     if torch.cuda.is_available():
@@ -335,6 +385,13 @@ def predict(
 
     final_annotations = []
 
+    # Activamos la ruta de probabilidad solo si se pide alguna mejora opt-in.
+    # Sin flags -> prob_path=False -> rama legacy idéntica al comportamiento actual.
+    prob_path = (te_threshold is not None) or export_conf or aggregate_windows
+    if prob_path:
+        print(f"🔬 Probability path ON (aggregate_windows={aggregate_windows}, "
+              f"te_threshold={te_threshold}, export_conf={export_conf})")
+
     print("🚀 Starting Vectorized Inference (FP16)...")
 
     with torch.no_grad():
@@ -361,36 +418,95 @@ def predict(
                 B_windows, L, _ = logits.shape
                 logits = logits.view(B_windows, L, -1)
 
-                # Argmax on GPU is faster
-                preds = torch.argmax(logits, dim=2).cpu().numpy()
+                if not prob_path:
+                    # Argmax on GPU is faster
+                    preds = torch.argmax(logits, dim=2).cpu().numpy()
+                else:
+                    # softmax en fp32 (NO fp16) para estabilidad del umbral
+                    probs = torch.softmax(logits.float(), dim=2).cpu().numpy()  # (B, L, C)
 
             # --- VECTORIZED RECONSTRUCTION ---
             offset_mapping = batch['offset_mapping'][0].numpy()
             global_start = batch['global_start'].item()
             seq_id = batch['seq_id'][0]
 
-            # Fast filter
-            valid_mask = (preds != bg_id) & (offset_mapping[:, :, 0] != offset_mapping[:, :, 1])
+            if not prob_path:
+                # ---------- RAMA LEGACY (idéntica al comportamiento original) ----------
+                valid_mask = (preds != bg_id) & (offset_mapping[:, :, 0] != offset_mapping[:, :, 1])
 
-            if not np.any(valid_mask):
+                if not np.any(valid_mask):
+                    continue
+
+                valid_labels_ids = preds[valid_mask]
+                valid_starts_local = offset_mapping[:, :, 0][valid_mask]
+                valid_ends_local = offset_mapping[:, :, 1][valid_mask]
+
+                valid_starts_global = valid_starts_local + global_start
+                valid_ends_global = valid_ends_local + global_start
+
+                chunk_results = [
+                    {
+                        "seq_id": seq_id,
+                        "start": int(s),
+                        "end": int(e),
+                        "label": id2label[l]
+                    }
+                    for s, e, l in zip(valid_starts_global, valid_ends_global, valid_labels_ids)
+                ]
+            else:
+                # ---------- RAMA DE PROBABILIDAD (agregación + umbral + conf) ----------
+                cs = offset_mapping[:, :, 0]
+                ce = offset_mapping[:, :, 1]
+                real = (cs != ce)  # descarta padding / tokens especiales (offset 0,0)
+
+                if not np.any(real):
+                    continue
+
+                cs_r = cs[real]; ce_r = ce[real]
+                probs_r = probs[real]  # (N_real, C)
+
+                # Agrupa por span (char_start, char_end): el mismo span físico
+                # comparte (cs,ce) entre ventanas solapadas -> una sola clave.
+                keys = np.stack([cs_r, ce_r], axis=1)
+                uniq, idx_first, inv = np.unique(
+                    keys, axis=0, return_index=True, return_inverse=True)
+                inv = inv.reshape(-1)  # defensivo: numpy 2.0 pudo devolver 2D
+                C = probs_r.shape[1]
+                if aggregate_windows:
+                    # promedia softmax entre todas las ventanas que cubren el span
+                    psum = np.zeros((len(uniq), C), dtype=np.float64)
+                    np.add.at(psum, inv, probs_r)
+                    counts = np.bincount(inv, minlength=len(uniq)).reshape(-1, 1)
+                    mean_prob = psum / np.maximum(counts, 1)
+                else:
+                    # sin agregar: representante = primera ventana vista del span
+                    mean_prob = probs_r[idx_first]
+
+                # mejor clase TE (excluyendo Background) y su probabilidad
+                te_prob = mean_prob.copy()
+                te_prob[:, bg_id] = -1.0
+                best = np.argmax(te_prob, axis=1)
+                best_p = te_prob[np.arange(len(uniq)), best]
+                bg_p = mean_prob[:, bg_id]
+
+                # compuerta Background + umbral de confianza
+                keep = best_p > bg_p
+                if te_threshold is not None:
+                    keep &= best_p >= te_threshold
+
+                chunk_results = [
+                    {
+                        "seq_id": seq_id,
+                        "start": int(uniq[k, 0]) + global_start,
+                        "end": int(uniq[k, 1]) + global_start,
+                        "label": id2label[int(best[k])],
+                        "conf": float(best_p[k]),
+                    }
+                    for k in np.nonzero(keep)[0]
+                ]
+
+            if not chunk_results:
                 continue
-
-            valid_labels_ids = preds[valid_mask]
-            valid_starts_local = offset_mapping[:, :, 0][valid_mask]
-            valid_ends_local = offset_mapping[:, :, 1][valid_mask]
-
-            valid_starts_global = valid_starts_local + global_start
-            valid_ends_global = valid_ends_local + global_start
-
-            chunk_results = [
-                {
-                    "seq_id": seq_id,
-                    "start": int(s),
-                    "end": int(e),
-                    "label": id2label[l]
-                }
-                for s, e, l in zip(valid_starts_global, valid_ends_global, valid_labels_ids)
-            ]
 
             chunk_merged = merge_annotations(chunk_results)
             final_annotations.extend(chunk_merged)
@@ -398,7 +514,11 @@ def predict(
     print(f"LOG: Inference completed.")
     print("🧩 Performing final merge...")
     final_clean_annotations = merge_annotations(final_annotations)
-    write_gff3(final_clean_annotations, output_gff)
+    if min_len > 0:
+        n_before = len(final_clean_annotations)
+        final_clean_annotations = filter_min_length(final_clean_annotations, min_len)
+        print(f"LOG: min_len={min_len} -> {n_before} -> {len(final_clean_annotations)} annotations")
+    write_gff3(final_clean_annotations, output_gff, export_conf=export_conf)
 
     if create_library:
         fasta_library_path = f"{output_gff}.fasta"
